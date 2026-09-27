@@ -4,7 +4,6 @@
 
 import pytest
 import torch
-
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import next_power_of_2
@@ -13,8 +12,9 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     apply_softcap,
     compute_tile_loop_bounds,
 )
-from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.kv_cache_interface import KVQuantMode
+
+from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -35,6 +35,47 @@ NUM_BLOCKS = [32768, 2048]
 # 0: use 2D kernel for decode
 # 8: use 3D kernel for decode
 SEQ_THRESHOLD_3D_VALUES = [0, 8]
+
+
+@pytest.mark.parametrize(
+    (
+        "head_size",
+        "sliding_window",
+        "element_size",
+        "is_prefill",
+        "is_sm75",
+        "expected_tile_size",
+    ),
+    [
+        (256, 1024, 4, True, True, 16),
+        (256, 1024, 4, False, True, 16),
+        (256, 1024, 2, True, True, 32),
+        (256, 1024, 4, True, False, 32),
+        (128, 1024, 4, True, True, 32),
+    ],
+)
+def test_t4_large_head_tile_size(
+    head_size: int,
+    sliding_window: int,
+    element_size: int,
+    is_prefill: bool,
+    is_sm75: bool,
+    expected_tile_size: int,
+) -> None:
+    from vllm.v1.attention.ops.triton_unified_attention import (
+        _get_tile_size,
+    )
+
+    assert (
+        _get_tile_size(
+            head_size,
+            sliding_window,
+            element_size,
+            is_prefill,
+            is_sm75=is_sm75,
+        )
+        == expected_tile_size
+    )
 
 
 @triton.jit
@@ -479,6 +520,34 @@ def test_triton_unified_attn(
     (
         torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
         f"{torch.max(torch.abs(output - ref_output))}",
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(75), reason="requires an SM75 GPU"
+)
+@pytest.mark.parametrize(
+    ("seq_lens", "seq_threshold_3D"),
+    [
+        ([(5, 1024)], 8),  # 2D prefill path from the reported failure.
+        ([(1, 1024)], 8),  # 3D decode path uses the same launch policy.
+    ],
+)
+def test_t4_large_head_shared_memory(
+    seq_lens: list[tuple[int, int]], seq_threshold_3D: int
+) -> None:
+    """Compile, launch, and compare large-head unified attention on T4."""
+    test_triton_unified_attn(
+        seq_lens=seq_lens,
+        num_heads=(8, 4),
+        head_size=256,
+        sliding_window=1024,
+        dtype=torch.float32,
+        block_size=16,
+        soft_cap=None,
+        num_blocks=2048,
+        q_dtype=None,
+        seq_threshold_3D=seq_threshold_3D,
     )
 
 

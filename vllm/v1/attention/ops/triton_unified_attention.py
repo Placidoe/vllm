@@ -791,8 +791,17 @@ def _get_tile_size(
     sliding_window: int,
     element_size: int,
     is_prefill: bool,
+    is_sm75: bool = False,
 ) -> int:
     """Select tile size with Gemma3-specific optimization."""
+    # A 32-token tile with a 256-wide FP32 head materializes one 16 KiB Q
+    # tile and two 32 KiB K/V tiles. That requires 80 KiB of shared memory,
+    # but SM75 devices (for example Tesla T4) provide only 64 KiB per block.
+    # A 16-token tile reduces the K/V footprint to 32 KiB total, bringing the
+    # launch below the hardware limit without changing the attention math.
+    if is_sm75 and head_size == 256 and element_size == 4:
+        return 16
+
     if _is_gemma3_attention(head_size, sliding_window):
         # Gemma3: use 32 for decode (default is 16)
         return 32
@@ -981,10 +990,18 @@ def unified_attention(
         chunk_lookback = -1
 
     TILE_SIZE_PREFILL = _get_tile_size(
-        head_size, sliding_window_val, q.element_size(), is_prefill=True
+        head_size,
+        sliding_window_val,
+        q.element_size(),
+        is_prefill=True,
+        is_sm75=current_platform.is_device_capability(75),
     )
     TILE_SIZE_DECODE = _get_tile_size(
-        head_size, sliding_window_val, q.element_size(), is_prefill=False
+        head_size,
+        sliding_window_val,
+        q.element_size(),
+        is_prefill=False,
+        is_sm75=current_platform.is_device_capability(75),
     )
 
     # Wider KV tile for the tuned large-head path (see above). Only the 2D
